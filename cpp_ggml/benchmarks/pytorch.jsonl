@@ -1,0 +1,3 @@
+{"backend": "pytorch-cuda", "input": "/home/asher/develop/code/dl/General-Keypoint-Detection-GGML/test_real_world/ims1/2007_007524.jpg", "mode": "text", "warmup": 3, "iters": 10, "total_ms": 231.5207890002057, "n_prompts": 5}
+{"backend": "pytorch-cuda", "input": "/home/asher/develop/code/dl/General-Keypoint-Detection-GGML/test_real_world/ims1/2007_007524.jpg", "mode": "visual", "warmup": 3, "iters": 10, "total_ms": 131.94553529610857, "n_prompts": 3}
+{"backend": "pytorch-cuda", "input": "/home/asher/develop/code/dl/General-Keypoint-Detection-GGML/test_real_world/ims1/2007_007524.jpg", "mode": "multimodal", "warmup": 3, "iters": 10, "total_ms": 299.84563579782844, "n_prompts": 3}

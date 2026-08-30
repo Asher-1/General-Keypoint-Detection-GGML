@@ -1,0 +1,6 @@
+[submodule "cpp_ggml/third_party/ggml"]
+	path = cpp_ggml/third_party/ggml
+	url = https://github.com/ggml-org/ggml.git
+[submodule "cpp_ggml/third_party/stb"]
+	path = cpp_ggml/third_party/stb
+	url = https://github.com/nothings/stb.git

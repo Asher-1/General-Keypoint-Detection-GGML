@@ -1,0 +1,37 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "cpu",
+      "displayName": "CPU-only (Release)",
+      "binaryDir": "${sourceDir}/build-cpu",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "cuda",
+      "displayName": "CUDA backend (Release, cc 8.9 / RTX 4090)",
+      "binaryDir": "${sourceDir}/build-cuda",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GKD_GGML_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "89"
+      }
+    },
+    {
+      "name": "vulkan",
+      "displayName": "Vulkan backend (Release)",
+      "binaryDir": "${sourceDir}/build-vulkan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GKD_GGML_VULKAN": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "cpu", "configurePreset": "cpu" },
+    { "name": "cuda", "configurePreset": "cuda" },
+    { "name": "vulkan", "configurePreset": "vulkan" }
+  ]
+}

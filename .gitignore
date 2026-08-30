@@ -1,2 +1,6 @@
 __pycache__/
 .vscode/
+cpp_ggml/models/pytorch
+*.gguf
+cpp_ggml/build-*/
+output/

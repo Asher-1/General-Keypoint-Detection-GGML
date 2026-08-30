@@ -1,0 +1,30 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index a8a1c09c..5a132020 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -94,6 +94,8 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+ #define GGML_LOG_WARN_ONCE(str) \
+     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
+ 
++static const char * g_gkd_cur_op = "<none>";
++
+ [[noreturn]]
+ void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
+     int id = -1; // in case cudaGetDevice fails
+@@ -101,7 +103,7 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
+ 
+     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
+     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
+-    GGML_LOG_ERROR("  %s\n", stmt);
++    GGML_LOG_ERROR("  %s (ggml op: %s)\n", stmt, g_gkd_cur_op);
+     // abort with GGML_ABORT to get a stack trace
+     GGML_ABORT(GGML_CUDA_NAME " error");
+ }
+@@ -2549,6 +2551,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+ 
++        g_gkd_cur_op = ggml_op_desc(node);
+         if (ggml_cuda_is_view_or_noop(node)) {
+             continue;
+         }

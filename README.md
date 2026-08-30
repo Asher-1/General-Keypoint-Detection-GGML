@@ -8,6 +8,7 @@
   - [4.1 Download Models](#41-download-models)
   - [4.2 Single-Object General Keypoint Detection](#42-single-object-general-keypoint-detection)
   - [4.3 Multi-Object General Keypoint Detection](#43-multi-object-general-keypoint-detection)
+  - [4.4 ggml C++ Runtime (CPU / CUDA / Vulkan)](#44-ggml-c-runtime-cpu--cuda--vulkan)
 - [5. MegaKPT Dataset](#5-megakpt-dataset)
 - [6. Model Training and Evaluation](#6-model-training-and-evaluation)
 - [7. Continual Learning on Your Dataset](#7-continual-learning-on-your-dataset)
@@ -371,6 +372,75 @@ Given the name `fish`, the the detection results are:
 
 
 
+
+### 4.4 ggml C++ Runtime (CPU / CUDA / Vulkan)
+
+<div align="center">
+
+![backends](https://img.shields.io/badge/backends-CPU_%7C_CUDA_%7C_Vulkan-4c72b0)
+![ggml](https://img.shields.io/badge/ggml-v0.21.0_patched_submodule-55a868)
+![weights](https://img.shields.io/badge/weights-f32_%7C_f16_%7C_q8_0_%7C_q4_0_%7C_q4_K-dd8452)
+![speedup](https://img.shields.io/badge/speedup-up_to_6.6x_vs_PyTorch_CUDA-c44e52)
+![parity](https://img.shields.io/badge/parity-%E2%89%A4_0.0004px_mean_on_official_demos-8172b2)
+![runtime](https://img.shields.io/badge/runtime_deps-zero_%28no_Python%29-333333)
+
+`🧱 checkpoint` ──🔧 convert──▶ `📦 gguf (483 MB–3.4 GB)` ──⚙️ cmake──▶ `🖥️ cpu │ 🎮 cuda │ 🔥 vulkan` ──🚀 detect──▶ `🎯 keypoints + scores`
+
+</div>
+
+```
+ 🧱 gkd_fullset.best ──🔧 convert──▶ 📦 <dtype>.gguf ──⚙️ cmake preset──▶ 🚀 gkd-cli / libgkdgml
+     PyTorch 6.3 GB       f32│f16│q8_0│q4_0│q4_K      cpu│cuda│vulkan          (pure C++, no Python)
+                                                                                  │
+     🎯 keypoints + scores ◄── decode ◄── detect graph (KG ×2 + head) ◄─────────┘
+              ggml_backend_sched: CUDA / Vulkan GPU + CPU fallback
+```
+
+`cpp_ggml/` ships a dependency-free C++ inference runtime for GKDT-L built on
+[ggml](https://github.com/ggml-org/ggml) (v0.21.0). It reproduces the official
+PyTorch forward pass graph-for-graph — the same preprocessing, the same
+tokenizer, the same keypoint decoding — and runs on CPU, CUDA and Vulkan with
+fp32, fp16, q8_0, q4_0 and q4_K weights. Any deviation from upstream ggml is
+kept as a git patch in `cpp_ggml/patches/ggml/` and applied automatically at
+cmake configure time, so the submodule stays pristine and the integration is
+reproducible for every developer.
+
+```bash
+cd cpp_ggml
+git submodule update --init third_party    # cmake auto-applies patches/ggml/*.patch
+
+# get the model weights — download the pre-converted GGUFs (all 5 dtypes),
+# or convert the official checkpoint yourself (next command)
+huggingface-cli download Asher-1/GKD_GGUF --local-dir models/gguf
+python scripts/convert_gkd_to_gguf.py --dtype f32   # also f16, q8_0, q4_0, q4_K
+
+# build (see CMakePresets.json for cpu / cuda / vulkan)
+cmake --preset cuda && cmake --build --preset cuda
+
+# detect keypoints with text / visual / multimodal prompts
+./build-cuda/bin/gkd-cli detect \
+    --model models/gguf/gkd_fullset-q4_K.gguf \
+    --input ../test_real_world/ims1/2007_007524.jpg \
+    --kps-texts nose "left eye" "right eye" "left ear" "right ear" \
+    --out result.jpg
+```
+
+Verified against the stock PyTorch model: on the **three official demo
+commands** (`test_real_world/scripts/eval_single_obj_gkd.sh`) every backend ×
+precision config reproduces PyTorch to ≤ 0.0004 px mean (multimodal / visual)
+and 0.29 px mean / 2.85 px worst keypoint (bbox ROI) — q4 included. On the
+full 15-image official sweep f32/f16/q8_0 stay point-identical on
+confidently-localized scenes; the q4 dtypes keep most keypoints but can shift
+argmax on near-flat heatmaps (documented boundary). On an RTX 4090 every GPU config beats the PyTorch reference
+end-to-end — e.g. cuda-q4_0 40.7 ms vs 231.5 ms for PyTorch in text mode
+(5.7×) — while the q4_K model file is 7× smaller than fp32. Latency and
+speedup matrices, per-config charts (`benchmarks/latency_matrix.png`,
+`benchmarks/speedup_matrix.png`, `benchmarks/speedup_table.md`), build
+instructions, numerical conventions, the parity workflow
+(`scripts/dump_taps.py` → `scripts/parity_reference.py`) and the minimal C API
+(`include/gkdgml.h`) are documented in
+[`cpp_ggml/README.md`](cpp_ggml/README.md); model details live in
+[`cpp_ggml/models/MODEL_CARD.md`](cpp_ggml/models/MODEL_CARD.md).
 
 ## 5. MegaKPT Dataset
 For the preparation of MegaKPT dataset, please see [`MegaKPT/README_for_MegaKPT.md`](MegaKPT/README_for_MegaKPT.md)
