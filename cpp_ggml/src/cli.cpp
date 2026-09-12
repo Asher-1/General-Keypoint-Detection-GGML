@@ -55,6 +55,17 @@ struct Args {
     int warmup = 10, iters = 50;
 };
 
+// A repeatable numeric option (--bbox / --support-kps) consumes values until
+// the next option. Detection boxes can legitimately be NEGATIVE (an object
+// touching the image border), so "starts with '-'" is not a valid terminator:
+// test whether the token parses as a float instead.
+static bool looks_like_float(const char* s) {
+    if (!s || !*s) return false;
+    char* end = nullptr;
+    std::strtof(s, &end);
+    return end && *end == '\0';
+}
+
 bool parse_args(int argc, char** argv, Args& a) {
     if (argc < 2) return false;
     a.cmd = argv[1];
@@ -68,10 +79,10 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (s == "--input") { while (i + 1 < argc && argv[i + 1][0] != '-') a.inputs.push_back(argv[++i]); }
         else if (s == "--out") a.out = next_str();
         else if (s == "--dump-taps") a.dump_taps = next_str();
-        else if (s == "--bbox") { while (i + 1 < argc && argv[i + 1][0] != '-') a.bbox.push_back(next_f()); }
+        else if (s == "--bbox") { while (i + 1 < argc && looks_like_float(argv[i + 1])) a.bbox.push_back(next_f()); }
         else if (s == "--kps-texts" || s == "--kps-textS") { while (i + 1 < argc && argv[i + 1][0] != '-') a.kps_texts.push_back(argv[++i]); }
         else if (s == "--support-image") a.support_image = next_str();
-        else if (s == "--support-kps") { while (i + 1 < argc && argv[i + 1][0] != '-') a.support_kps.push_back(next_f()); }
+        else if (s == "--support-kps") { while (i + 1 < argc && looks_like_float(argv[i + 1])) a.support_kps.push_back(next_f()); }
         else if (s == "--skeleton") { while (i + 1 < argc && argv[i + 1][0] != '-') a.skeleton.push_back(next_i()); }
         else if (s == "--threads") a.threads = next_i();
         else if (s == "--warmup") a.warmup = next_i();
@@ -127,43 +138,54 @@ int cmd_detect_or_bench(const Args& a) {
         StageTiming t;
         int n_roi = (int)a.bbox.size() / 4;
         if (!session->detect(image, bbox, n_roi, extra, out, &t)) return 1;
-        const DetectOutput& r = out[0];
 
-        std::printf("backend: %s | prompts: %d | total: %.1f ms (preproc %.1f, vision %.1f, text %.1f, prompts %.1f, detect %.1f, decode %.1f)\n",
-                    session->backend(), r.n_prompts, t.total, t.preprocess, t.vision, t.text,
-                    t.prompt_prep, t.detect, t.decode);
-        for (int j = 0; j < r.n_prompts; j++) {
-            std::printf("  kp %2d: norm=(%+.4f, %+.4f) score=%.4f\n", j,
-                        r.kps_norm[j * 2], r.kps_norm[j * 2 + 1], r.scores[j]);
-        }
-        // rebuild the query ScaleTrans (identical math to preprocess_roi)
-        float bb[4] = {0, 0, (float)(image.w - 1), (float)(image.h - 1)};
-        if (a.bbox.size() >= 4) std::memcpy(bb, a.bbox.data(), sizeof(float) * 4);
-        PreprocessResult pr = preprocess_roi(image, bb, session->params().img_size, nullptr, 0, nullptr);
+        std::printf("backend: %s | rois: %d | prompts: %d | total: %.1f ms (preproc %.1f, vision %.1f, text %.1f, prompts %.1f, detect %.1f, decode %.1f)\n",
+                    session->backend(), n_roi > 0 ? n_roi : 1, out[0].n_prompts, t.total, t.preprocess,
+                    t.vision, t.text, t.prompt_prep, t.detect, t.decode);
 
-        // machine-readable line for the benchmark driver
-        std::printf("{\"json\":{\"backend\":\"%s\",\"input\":\"%s\",\"n_prompts\":%d,"
-                    "\"trans\":[%.8f,%.8f,%.8f],\"kps_norm\":[",
-                    session->backend(), a.inputs[0].c_str(), r.n_prompts,
-                    pr.trans.scale, pr.trans.offset_x, pr.trans.offset_y);
-        for (int j = 0; j < r.n_prompts; j++)
-            std::printf("%s%.6f,%.6f", j ? "," : "", r.kps_norm[j * 2], r.kps_norm[j * 2 + 1]);
-        std::printf("],\"scores\":[");
-        for (int j = 0; j < r.n_prompts; j++)
-            std::printf("%s%.6f", j ? "," : "", r.scores[j]);
-        std::printf("]}}\n");
-
-        if (!a.out.empty()) {
-            // recover to original image coords
-            std::vector<float> kps_orig((size_t)r.n_prompts * 2);
-            recover_kps(r.kps_norm.data(), r.n_prompts, session->params().img_size, pr.trans, kps_orig.data());
-            std::vector<SkeletonLink> links;
-            for (size_t i = 0; i + 1 < a.skeleton.size(); i += 2) {
-                links.push_back({a.skeleton[i] - 1, a.skeleton[i + 1] - 1});
+        // one machine-readable line per ROI, each with its own ScaleTrans
+        // (official single_obj_gkd_inference returns N_bbox x N x 2 predictions)
+        for (int roi = 0; roi < (n_roi > 0 ? n_roi : 1); roi++) {
+            const DetectOutput& r = out[roi];
+            for (int j = 0; j < r.n_prompts; j++) {
+                std::printf("  roi %d kp %2d: norm=(%+.4f, %+.4f) score=%.4f\n", roi, j,
+                            r.kps_norm[j * 2], r.kps_norm[j * 2 + 1], r.scores[j]);
             }
-            KeypointStyle style;
-            render_and_save(image, kps_orig.data(), r.scores.data(), r.n_prompts, links, style, a.out);
-            std::printf("rendered: %s\n", a.out.c_str());
+            // rebuild this ROI's ScaleTrans (identical math to preprocess_roi)
+            float bb[4] = {0, 0, (float)(image.w - 1), (float)(image.h - 1)};
+            if (a.bbox.size() >= 4 * (roi + 1))
+                std::memcpy(bb, a.bbox.data() + 4 * roi, sizeof(float) * 4);
+            PreprocessResult pr = preprocess_roi(image, bb, session->params().img_size, nullptr, 0, nullptr);
+
+            std::printf("{\"json\":{\"backend\":\"%s\",\"input\":\"%s\",\"roi\":%d,\"n_prompts\":%d,"
+                        "\"trans\":[%.8f,%.8f,%.8f],\"kps_norm\":[",
+                        session->backend(), a.inputs[0].c_str(), roi, r.n_prompts,
+                        pr.trans.scale, pr.trans.offset_x, pr.trans.offset_y);
+            for (int j = 0; j < r.n_prompts; j++)
+                std::printf("%s%.6f,%.6f", j ? "," : "", r.kps_norm[j * 2], r.kps_norm[j * 2 + 1]);
+            std::printf("],\"scores\":[");
+            for (int j = 0; j < r.n_prompts; j++)
+                std::printf("%s%.6f", j ? "," : "", r.scores[j]);
+            std::printf("]}}\n");
+
+            if (!a.out.empty()) {
+                std::vector<float> kps_orig((size_t)r.n_prompts * 2);
+                recover_kps(r.kps_norm.data(), r.n_prompts, session->params().img_size,
+                            pr.trans, kps_orig.data());
+                std::vector<SkeletonLink> links;
+                for (size_t i = 0; i + 1 < a.skeleton.size(); i += 2) {
+                    links.push_back({a.skeleton[i] - 1, a.skeleton[i + 1] - 1});
+                }
+                KeypointStyle style;
+                std::string out_path = a.out;
+                if (n_roi > 1) {
+                    std::string base = a.out.substr(0, a.out.rfind('.'));
+                    std::string ext = a.out.substr(a.out.rfind('.'));
+                    out_path = base + "_roi" + std::to_string(roi) + ext;
+                }
+                render_and_save(image, kps_orig.data(), r.scores.data(), r.n_prompts, links, style, out_path);
+                std::printf("rendered: %s\n", out_path.c_str());
+            }
         }
         return 0;
     }

@@ -172,6 +172,20 @@ else()
     message(STATUS "zlib not found: pass an already-extracted BPE vocab file via --bpe-txt")
 endif()
 
+# Exact-JPEG decoding. The official pipeline reads images through cv2.imread,
+# which uses libjpeg: stb's own JPEG decoder differs by up to +-3/255 on ~11%
+# of pixels, which propagated through the network as preprocessing noise.
+# Optional - the engine falls back to stb_image when libjpeg is unavailable.
+find_package(JPEG QUIET)
+if(JPEG_FOUND)
+    target_compile_definitions(gkdgml PRIVATE GKD_HAVE_LIBJPEG)
+    target_link_libraries(gkdgml PRIVATE ${JPEG_LIBRARIES})
+    target_include_directories(gkdgml PRIVATE ${JPEG_INCLUDE_DIRS})
+    message(STATUS "libjpeg found: JPEG inputs decode through libjpeg (cv2/PIL bit-exact)")
+else()
+    message(STATUS "libjpeg not found: JPEG inputs decode through stb_image (small pixel deviations)")
+endif()
+
 find_package(OpenMP QUIET)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(gkdgml PRIVATE OpenMP::OpenMP_CXX)
@@ -195,4 +209,7 @@ endif()
 if(GKD_GGML_BUILD_TESTS)
     add_executable(gkd-test-ops tests/test_ops.cpp)
     target_link_libraries(gkd-test-ops PRIVATE gkdgml)
+    # white-box test: includes src/tokenizer.cpp for the static ftfy subset
+    add_executable(gkd-test-ftfy tests/test_ftfy.cpp src/common.cpp)  # test_ftfy includes tokenizer.cpp (white-box)
+    target_link_libraries(gkd-test-ftfy PRIVATE ggml)
 endif()

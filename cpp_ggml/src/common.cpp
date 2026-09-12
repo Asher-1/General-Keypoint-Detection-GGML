@@ -3,6 +3,7 @@
 
 #include <cstdarg>
 #include <cstdlib>
+#include <filesystem>
 #include <algorithm>
 
 namespace gkd {
@@ -51,6 +52,12 @@ double TimingStats::p(int percent) const {
 }
 
 void dump_f32(const std::string& path, const std::vector<int64_t>& shape, const float* data) {
+    // create parent directories so --dump-taps works with a fresh path
+    size_t slash = path.rfind('/');
+    if (slash != std::string::npos) {
+        std::error_code ec;
+        std::filesystem::create_directories(path.substr(0, slash), ec);
+    }
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) {
         GKD_LOG_ERROR("cannot open %s for writing", path.c_str());

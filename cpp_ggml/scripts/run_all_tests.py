@@ -70,12 +70,11 @@ def discover_configs():
 CONFIGS = discover_configs()
 
 
-def run(cmd, env=None):
-    e = dict(os.environ)
-    e.setdefault("CUDA_PATH", "/usr/local/cuda-12.6")
-    if env:
-        e.update(env)
-    r = subprocess.run(cmd, capture_output=True, text=True, env=e)
+def run(cmd):
+    # The compiled gkd-cli locates its shared libraries via rpath/ldconfig; no
+    # environment injection (e.g. CUDA_PATH) is needed at runtime - toolchain
+    # paths only matter at cmake configure time (see run_e2e.py).
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.stderr.write(r.stdout[-2000:] + r.stderr[-2000:])
         raise RuntimeError(f"command failed: {' '.join(cmd)}")

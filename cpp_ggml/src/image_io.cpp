@@ -7,7 +7,14 @@
 #include "stb_image.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+
+#if defined(GKD_HAVE_LIBJPEG)
+#include <csetjmp>
+#include <cstdio>
+#include <jpeglib.h>
+#endif
 
 #if defined(GKD_USE_OPENMP)
 #include <omp.h>
@@ -15,7 +22,79 @@
 
 namespace gkd {
 
+#if defined(GKD_HAVE_LIBJPEG)
+namespace {
+
+struct JpegErrorMgr {
+    jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+void jpeg_error_exit(j_common_ptr cinfo) {
+    longjmp(reinterpret_cast<JpegErrorMgr*>(cinfo->err)->setjmp_buffer, 1);
+}
+
+// libjpeg decode with library defaults - the exact decoder behind cv2.imread
+// and PIL (islow IDCT, fancy upsampling), so JPEG inputs are bit-identical to
+// the official pipeline. (stb's own decoder deviates by up to +-3/255.)
+bool load_image_jpeg_libjpeg(const std::string& path, RgbImage& out) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    jpeg_decompress_struct cinfo{};
+    JpegErrorMgr jerr{};
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpeg_error_exit;
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        std::fclose(f);
+        return false;
+    }
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, f);
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        std::fclose(f);
+        return false;
+    }
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+    if (cinfo.output_components != 3) {
+        jpeg_destroy_decompress(&cinfo);
+        std::fclose(f);
+        return false;
+    }
+    RgbImage img(cinfo.output_width, cinfo.output_height);
+    while (cinfo.output_scanline < cinfo.output_height) {
+        uint8_t* row = img.row(cinfo.output_scanline);
+        JSAMPROW rows[1] = {row};
+        jpeg_read_scanlines(&cinfo, rows, 1);
+    }
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    std::fclose(f);
+    out = std::move(img);
+    return true;
+}
+
+}  // namespace
+#endif  // GKD_HAVE_LIBJPEG
+
 bool load_image(const std::string& path, RgbImage& out) {
+#if defined(GKD_HAVE_LIBJPEG)
+    // JPEG magic (FF D8): decode through libjpeg for official-pipeline parity
+    {
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (f) {
+            unsigned char magic[2] = {0, 0};
+            size_t n = std::fread(magic, 1, 2, f);
+            std::fclose(f);
+            if (n == 2 && magic[0] == 0xFF && magic[1] == 0xD8 &&
+                load_image_jpeg_libjpeg(path, out)) {
+                return true;
+            }
+        }
+    }
+#endif
     int w, h, c;
     unsigned char* data = stbi_load(path.c_str(), &w, &h, &c, 3);
     if (!data) {
@@ -30,85 +109,126 @@ bool load_image(const std::string& path, RgbImage& out) {
 }
 
 // ---------------------------------------------------------------------------
-// PIL-compatible antialiased bilinear resize (triangle filter).
-// PIL samples with support = 1.0 * scale when downscaling, 1.0 when upscaling.
+// Pillow bit-exact antialiased bilinear resize (triangle filter).
+//
+// Port of Pillow src/libImaging/Resample.c (verified against Pillow 12.0.0),
+// which is exactly what the official pipeline's Image.resize(BILINEAR) runs:
+//   precompute per axis (double):
+//     filterscale = scale = src/dst;  if (filterscale < 1) filterscale = 1
+//     support = 1.0 * filterscale;  ksize = ceil(support)*2 + 1
+//     xmin = (int)(center - support + 0.5) clamped to 0   // C trunc!
+//     xmax = (int)(center + support + 0.5) clamped to src // tap COUNT
+//     w[x] = tri((x + xmin - center + 0.5) / filterscale), normalized by sum
+//   fixed point: PRECISION_BITS = 22; k[x] = (int)(0.5 + w[x] * (1 << 22))
+//   pass (INT32 accumulation, uint8 intermediate image):
+//     acc = 1 << 21;  acc += pixel * k[x];  out = clamp(acc >> 22, 0, 255)
+//   order: HORIZONTAL pass into a uint8 buffer, then VERTICAL pass.
+//
+// The per-pass uint8 rounding is part of the reference behavior: collapsing
+// both passes into a single float accumulation (our previous implementation)
+// shifts values by ~1 LSB, which propagated through the 24-block network as
+// preprocessing noise and caused near-tie heatmap argmax flips.
 // ---------------------------------------------------------------------------
 RgbImage resize_bilinear_pil(const RgbImage& src, int dst_w, int dst_h) {
     if (dst_w == src.w && dst_h == src.h) return src;
 
-    const float scale_x = (float)dst_w / src.w;
-    const float scale_y = (float)dst_h / src.h;
+    constexpr int PRECISION_BITS = 22;  // 32 - 8 - 2 in Resample.c
+    auto clip8 = [](int32_t v) {
+        // arithmetic shift == floor; the lookup table in Resample.c clamps
+        return (uint8_t)std::min(255, std::max(0, (int)(v >> PRECISION_BITS)));
+    };
 
-    // Pillow-exact precompute (Resample.c::precompute_coeffs, double precision):
-    //   filterscale = max(1, src/dst); support = 1 * filterscale
-    //   center = (j + 0.5) * src / dst
-    //   taps x in [ceil(center - support), floor(center + support)] clamped,
-    //   weight = tri((x + 0.5 - center) / filterscale) with tri: |x| < 1 -> 1-|x|,
-    //   then normalized by the tap sum.
-    struct AxisWeights {
-        std::vector<int> i0, i1;
-        std::vector<int> off;   // offset of this pixel's taps inside `w`
-        std::vector<float> w;   // concatenated weights
+    // per-axis coefficient table, exactly Resample.c::precompute_coeffs
+    struct AxisCoefs {
+        int ksize = 0;
+        std::vector<int> xmin, cnt;
+        std::vector<int32_t> k;  // dst_len * ksize, row-major
     };
     auto build_axis = [&](int src_len, int dst_len) {
-        double filterscale = (dst_len < src_len) ? (double)src_len / dst_len : 1.0;
+        AxisCoefs ax;
+        double scale = (double)src_len / dst_len;
+        double filterscale = scale < 1.0 ? 1.0 : scale;
         double support = 1.0 * filterscale;
-        AxisWeights ax;
-        ax.i0.resize(dst_len);
-        ax.i1.resize(dst_len);
-        ax.off.resize(dst_len);
-        for (int j = 0; j < dst_len; j++) {
-            double center = (j + 0.5) * (double)src_len / dst_len;
-            int i0 = (int)std::ceil(center - support);
-            int i1 = (int)std::floor(center + support);
-            if (i0 < 0) i0 = 0;
-            if (i1 > src_len - 1) i1 = src_len - 1;
-            ax.i0[j] = i0;
-            ax.i1[j] = i1;
-            ax.off[j] = (int)ax.w.size();
-            double sum = 0.0;
-            for (int i = i0; i <= i1; i++) {
-                double arg = (i - center + 0.5) / filterscale;
-                double wt = (arg < -1.0 || arg >= 1.0) ? 0.0 : 1.0 - std::fabs(arg);
-                ax.w.push_back((float)wt);
-                sum += wt;
+        ax.ksize = (int)std::ceil(support) * 2 + 1;
+        ax.xmin.resize(dst_len);
+        ax.cnt.resize(dst_len);
+        ax.k.assign((size_t)dst_len * ax.ksize, 0);
+        for (int xx = 0; xx < dst_len; xx++) {
+            double center = (xx + 0.5) * scale;  // in0 = 0 (full-image box)
+            double ss = 1.0 / filterscale;
+            int xmin = (int)(center - support + 0.5);  // C trunc, like the reference
+            if (xmin < 0) xmin = 0;
+            int xmax = (int)(center + support + 0.5);
+            if (xmax > src_len) xmax = src_len;
+            int n = xmax - xmin;
+            ax.xmin[xx] = xmin;
+            ax.cnt[xx] = n;
+            double ww = 0.0;
+            std::vector<double> w(n);
+            for (int x = 0; x < n; x++) {
+                double arg = (x + xmin - center + 0.5) * ss;
+                if (arg < 0) arg = -arg;
+                w[x] = arg < 1.0 ? 1.0 - arg : 0.0;
+                ww += w[x];
             }
-            if (sum > 0.0) {
-                for (int k = ax.off[j]; k < (int)ax.w.size(); k++) ax.w[k] = (float)(ax.w[k] / sum);
+            for (int x = 0; x < n; x++) {
+                if (ww != 0.0) w[x] /= ww;
+                // normalize_coeffs_8bpc: (int)(0.5 + w * (1 << PRECISION_BITS))
+                ax.k[(size_t)xx * ax.ksize + x] =
+                    (int32_t)(0.5 + w[x] * (float)(1 << PRECISION_BITS));
             }
         }
         return ax;
     };
 
-    const AxisWeights xs = build_axis(src.w, dst_w);
-    const AxisWeights ys = build_axis(src.h, dst_h);
+    const AxisCoefs xs = build_axis(src.w, dst_w);
+    const AxisCoefs ys = build_axis(src.h, dst_h);
+
+    // horizontal pass into a uint8 intermediate (pass order matters)
+    RgbImage tmp(dst_w, src.h);
+#if defined(GKD_USE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int y = 0; y < src.h; y++) {
+        const uint8_t* srow = src.row(y);
+        uint8_t* drow = tmp.row(y);
+        for (int x = 0; x < dst_w; x++) {
+            const int xmin = xs.xmin[x], n = xs.cnt[x];
+            const int32_t* k = &xs.k[(size_t)x * xs.ksize];
+            int32_t a0 = 1 << (PRECISION_BITS - 1);
+            int32_t a1 = a0, a2 = a0;
+            for (int i = 0; i < n; i++) {
+                const uint8_t* px = srow + (xmin + i) * 3;
+                a0 += px[0] * k[i];
+                a1 += px[1] * k[i];
+                a2 += px[2] * k[i];
+            }
+            drow[x * 3 + 0] = clip8(a0);
+            drow[x * 3 + 1] = clip8(a1);
+            drow[x * 3 + 2] = clip8(a2);
+        }
+    }
 
     RgbImage dst(dst_w, dst_h);
 #if defined(GKD_USE_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
     for (int y = 0; y < dst_h; y++) {
+        const int ymin = ys.xmin[y], n = ys.cnt[y];
+        const int32_t* k = &ys.k[(size_t)y * ys.ksize];
+        uint8_t* drow = dst.row(y);
         for (int x = 0; x < dst_w; x++) {
-            float acc[3] = {0.f, 0.f, 0.f};
-            const int y0 = ys.i0[y], y1 = ys.i1[y];
-            const int x0 = xs.i0[x], x1 = xs.i1[x];
-            const float* xw = &xs.w[xs.off[x]];
-            for (int sy = y0; sy <= y1; sy++) {
-                const uint8_t* srow = src.row(sy);
-                float wy = ys.w[ys.off[y] + (sy - y0)];
-                for (int sx = x0; sx <= x1; sx++) {
-                    float w = wy * xw[sx - x0];
-                    const uint8_t* px = srow + sx * 3;
-                    acc[0] += w * px[0];
-                    acc[1] += w * px[1];
-                    acc[2] += w * px[2];
-                }
+            int32_t a0 = 1 << (PRECISION_BITS - 1);
+            int32_t a1 = a0, a2 = a0;
+            for (int i = 0; i < n; i++) {
+                const uint8_t* px = tmp.row(ymin + i) + x * 3;
+                a0 += px[0] * k[i];
+                a1 += px[1] * k[i];
+                a2 += px[2] * k[i];
             }
-            uint8_t* d = dst.row(y) + x * 3;
-            for (int c = 0; c < 3; c++) {
-                int v = (int)std::lround(acc[c]);
-                d[c] = (uint8_t)std::min(255, std::max(0, v));
-            }
+            drow[x * 3 + 0] = clip8(a0);
+            drow[x * 3 + 1] = clip8(a1);
+            drow[x * 3 + 2] = clip8(a2);
         }
     }
     return dst;

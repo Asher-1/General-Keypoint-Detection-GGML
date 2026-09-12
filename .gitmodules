@@ -4,3 +4,6 @@
 [submodule "cpp_ggml/third_party/stb"]
 	path = cpp_ggml/third_party/stb
 	url = https://github.com/nothings/stb.git
+[submodule "cpp_ggml/third_party/ultralytics-ggml"]
+	path = cpp_ggml/third_party/ultralytics-ggml
+	url = git@github.com:Asher-1/ultralytics-ggml.git

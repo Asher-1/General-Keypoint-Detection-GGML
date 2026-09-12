@@ -379,7 +379,7 @@ Given the name `fish`, the the detection results are:
 
 ![backends](https://img.shields.io/badge/backends-CPU_%7C_CUDA_%7C_Vulkan-4c72b0)
 ![ggml](https://img.shields.io/badge/ggml-v0.21.0_patched_submodule-55a868)
-![weights](https://img.shields.io/badge/weights-f32_%7C_f16_%7C_q8_0_%7C_q4_0_%7C_q4_K-dd8452)
+![weights](https://img.shields.io/badge/weights-f32_%7C_f16_%7C_q8_0_%7C_q4_K-dd8452)
 ![speedup](https://img.shields.io/badge/speedup-up_to_6.6x_vs_PyTorch_CUDA-c44e52)
 ![parity](https://img.shields.io/badge/parity-%E2%89%A4_0.0004px_mean_on_official_demos-8172b2)
 ![runtime](https://img.shields.io/badge/runtime_deps-zero_%28no_Python%29-333333)
@@ -390,7 +390,7 @@ Given the name `fish`, the the detection results are:
 
 ```
  🧱 gkd_fullset.best ──🔧 convert──▶ 📦 <dtype>.gguf ──⚙️ cmake preset──▶ 🚀 gkd-cli / libgkdgml
-     PyTorch 6.3 GB       f32│f16│q8_0│q4_0│q4_K      cpu│cuda│vulkan          (pure C++, no Python)
+     PyTorch 6.3 GB       f32│f16│q8_0│q4_K      cpu│cuda│vulkan          (pure C++, no Python)
                                                                                   │
      🎯 keypoints + scores ◄── decode ◄── detect graph (KG ×2 + head) ◄─────────┘
               ggml_backend_sched: CUDA / Vulkan GPU + CPU fallback
@@ -400,10 +400,57 @@ Given the name `fish`, the the detection results are:
 [ggml](https://github.com/ggml-org/ggml) (v0.21.0). It reproduces the official
 PyTorch forward pass graph-for-graph — the same preprocessing, the same
 tokenizer, the same keypoint decoding — and runs on CPU, CUDA and Vulkan with
-fp32, fp16, q8_0, q4_0 and q4_K weights. Any deviation from upstream ggml is
+fp32, fp16, q8_0 and q4_K weights (the engine also supports q4_0). Any deviation from upstream ggml is
 kept as a git patch in `cpp_ggml/patches/ggml/` and applied automatically at
 cmake configure time, so the submodule stays pristine and the integration is
 reproducible for every developer.
+
+**One-click end-to-end** (auto-detects toolchains, downloads/converts models,
+builds every supported backend, runs the official demo, and reports a summary —
+re-runs reuse everything already done):
+
+```bash
+python3 run_e2e.py --help          # full option list
+python3 run_e2e.py                 # auto end-to-end
+python3 run_e2e.py --full          # + full benchmark matrix and parity grid
+```
+
+**One-click dual-implementation inference with rendered output**
+(`run_inference.py`): the official PyTorch pipeline and the pure C++ ggml
+engine each run the FULL pipeline end-to-end on the same image and prompts,
+and their keypoints are rendered with identical drawing plus a side-by-side
+chart and numeric deltas — no hardcoded paths, every dependency auto-detected
+and a missing one skipped with an actionable message (the C++ subprocess runs
+first; the torch model pins several GB of VRAM and would OOM the engine the
+other way around):
+
+```bash
+python3 run_inference.py --help    # full option list
+python3 run_inference.py           # demo image, all three prompt modes
+python3 run_inference.py --skip-python   # C++-only deployment box
+# -> output/inference_<image>/{python_official.json, cpp_ggml.json,
+#    cpp_<mode>_rendered.jpg, python_vs_cpp.png}
+```
+
+**One-click PURE C++ end-to-end** (`run_cpp.py`): everything the C++ runtime
+needs, in one command — submodule init, yolo-cli (detector) + gkd-cli (engine)
+builds per usable backend, weight acquisition (HuggingFace download, or
+one-time conversion from the official checkpoint / YOLO-World + CLIP), and
+end-to-end inference: single-object GKD in all three prompt modes (rendered
+JPEGs + scores) AND multi-object GKD through the pure-C++ YOLO-World detector.
+Every stage reuses its previous outputs, so re-runs are seconds:
+
+```bash
+python3 run_cpp.py --help            # full option list
+python3 run_cpp.py                   # env -> submodules -> build -> models -> infer
+python3 run_cpp.py --stage infer     # inference only
+python3 run_cpp.py --backend vulkan --dtype f16 --image my.jpg \
+    --obj-type 'cat, dog'            # custom everything
+# -> output/cpp_e2e/single_{text,visual,multimodal}.jpg
+#    <multi-image>_gkd_multi.json
+```
+
+Manual walk-through:
 
 ```bash
 cd cpp_ggml
@@ -412,7 +459,7 @@ git submodule update --init third_party    # cmake auto-applies patches/ggml/*.p
 # get the model weights — download the pre-converted GGUFs (all 5 dtypes),
 # or convert the official checkpoint yourself (next command)
 huggingface-cli download Asher-1/GKD_GGUF --local-dir models/gguf
-python scripts/convert_gkd_to_gguf.py --dtype f32   # also f16, q8_0, q4_0, q4_K
+python scripts/convert_gkd_to_gguf.py --dtype f32   # also f16, q8_0, q4_K
 
 # build (see CMakePresets.json for cpu / cuda / vulkan)
 cmake --preset cuda && cmake --build --preset cuda
@@ -425,15 +472,23 @@ cmake --preset cuda && cmake --build --preset cuda
     --out result.jpg
 ```
 
-Verified against the stock PyTorch model: on the **three official demo
-commands** (`test_real_world/scripts/eval_single_obj_gkd.sh`) every backend ×
-precision config reproduces PyTorch to ≤ 0.0004 px mean (multimodal / visual)
-and 0.29 px mean / 2.85 px worst keypoint (bbox ROI) — q4 included. On the
-full 15-image official sweep f32/f16/q8_0 stay point-identical on
-confidently-localized scenes; the q4 dtypes keep most keypoints but can shift
-argmax on near-flat heatmaps (documented boundary). On an RTX 4090 every GPU config beats the PyTorch reference
-end-to-end — e.g. cuda-q4_0 40.7 ms vs 231.5 ms for PyTorch in text mode
-(5.7×) — while the q4_K model file is 7× smaller than fp32. Latency and
+Verified against the stock PyTorch model: the C++ image pipeline (libjpeg
+decode + PIL's fixed-point resample) is **byte-exact**, and on the 37
+keypoints the official model is confident about, f32/f16 track PyTorch at
+0.003 px mean with **zero argmax flips** on every backend × precision
+config; on the three official demo commands every config reproduces
+PyTorch to ≤ 0.0004 px mean (multimodal / visual) and 0.29 px mean (bbox
+ROI) — q4 included. On flat-heatmap scenes (where the official model
+itself scores < 0.3) the argmax is noise for any implementation; the
+official remedy is the **multi-object pipeline** (detector ROIs + visual
+prompts), which the runtime reproduces **pure C++ end-to-end** via
+`run_multi_object.py` (ultralytics-ggml submodule YOLO-World detection →
+bbox interface → C++ GKD; the official Python adapters remain as reference
+paths and are verified against the official `demo()` at 0.0002 px on
+confident ROIs).
+On an RTX 4090 every GPU config beats the PyTorch reference
+end-to-end — e.g. cuda-q4_K 41.2 ms vs 231.5 ms for PyTorch in text mode
+(5.6×) — while the q4_K model file is 7× smaller than fp32. Latency and
 speedup matrices, per-config charts (`benchmarks/latency_matrix.png`,
 `benchmarks/speedup_matrix.png`, `benchmarks/speedup_table.md`), build
 instructions, numerical conventions, the parity workflow

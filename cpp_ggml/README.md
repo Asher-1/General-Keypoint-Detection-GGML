@@ -6,14 +6,24 @@ implementation — no Python and no PyTorch at runtime — with automatic
 CPU / CUDA / Vulkan execution through `ggml_backend_sched`.
 
 Verified parity against the stock PyTorch model (RTX 4090, same inputs):
-keypoint coordinates agree to **≤ 0.0048 px** in all three prompt modes for
-every backend × precision config of the full matrix (cpu/cuda/vulkan ×
-f32/f16/q8_0/q4_0/q4_K). Score differences stay ≤ 0.0013 for f32/f16/q8_0;
-the q4 dtypes trade up to ~0.026 (q4_0) / ~0.017 (q4_K) of score amplitude
-while keeping every coordinate. Every GPU config beats the PyTorch reference
-end-to-end — cuda-q4_0 runs 40.7 ms vs 231.5 ms in text mode (5.7×); see
+the image pipeline (JPEG decode through libjpeg, PIL's fixed-point resample,
+crop and pad) is **byte-exact**, so on the 37 keypoints the official model is
+confident about, f32/f16 track PyTorch at **0.003 px mean / 0.01 px max with
+zero argmax flips** across every backend × precision config of the full
+matrix (cpu/cuda/vulkan × f32/f16/q8_0/q4_K). Score differences stay
+≤ 0.0013 for f32/f16/q8_0; q4_K trades up to ~0.017 of score amplitude while
+keeping every coordinate. Every GPU config beats the PyTorch reference
+end-to-end — cuda-q4_K runs 41.2 ms vs 231.5 ms in text mode (5.6×); see
 `benchmarks/speedup_table.md`, `benchmarks/latency_matrix.png` and
 `benchmarks/speedup_matrix.png`.
+
+## One-click end-to-end
+
+From the repository root: `python3 run_e2e.py` detects the toolchains,
+downloads/converts the weights, builds every supported backend, runs the
+official demo and prints a stage-by-stage summary (`--help` for options,
+`--full` to add the complete benchmark matrix). The sections below document
+each step individually.
 
 ## Pipeline at a glance
 
@@ -62,7 +72,7 @@ cpp_ggml/
 │   ├── image_io.cpp                     # PIL-exact resize/pad preprocessing
 │   └── ...                              # backend, capi, postprocess, common
 ├── scripts/
-│   ├── convert_gkd_to_gguf.py           # checkpoint -> GGUF (f32/f16/q8_0/q4_0/q4_K)
+│   ├── convert_gkd_to_gguf.py           # checkpoint -> GGUF (f32/f16/q8_0/q4_K)
 │   ├── dump_taps.py                     # official PyTorch per-layer reference taps
 │   ├── parity_reference.py              # tap diff tool
 │   ├── bench_pytorch.py                 # stock PyTorch latency reference
@@ -157,7 +167,7 @@ training run), `scripts/convert_gkd_to_gguf.py` reads **only**
 `models/gguf/gkd_fullset-<dtype>.gguf`:
 
 ```bash
-python scripts/convert_gkd_to_gguf.py --dtype f32    # also: f16, q8_0, q4_0, q4_K
+python scripts/convert_gkd_to_gguf.py --dtype f32    # also: f16, q8_0, q4_K (q4_0 optional)
 ```
 
 Details worth knowing:
@@ -213,22 +223,22 @@ less error.
 **Measured on GKDT-L** (15 official images, mean; RTX 4090 + i9-14900K;
 full matrix in `benchmarks/`):
 
-| | f32 | f16 | q8_0 | q4_0 | q4_K |
-|---|---|---|---|---|---|
-| file size | 3.39 GiB | 1.70 GiB | 905 MiB | 483 MiB | 483 MiB |
-| bits/value (2-D weights) | 32 | 16 | 8.5 | 4.5 | 4.5 |
-| max score diff vs PyTorch | 0.0011 | 0.0012 | 0.0021 | 0.026 | 0.017 |
-| coordinates vs PyTorch | ≤ 0.0048 px — identical for **all** dtypes |||||
-| cuda · text latency | 52.8 ms | 41.4 | 41.3 | **40.7** | 41.2 |
-| vulkan · text latency | 51.5 | **48.9** | 51.7 | 52.5 | 52.4 |
-| cpu · text latency | 1555 | 1734 | 1671 | 1882 | **1211** |
+| | f32 | f16 | q8_0 | q4_K |
+|---|---|---|---|---|
+| file size | 3.39 GiB | 1.70 GiB | 905 MiB | 483 MiB |
+| bits/value (2-D weights) | 32 | 16 | 8.5 | 4.5 |
+| max score diff vs PyTorch | 0.0011 | 0.0012 | 0.0021 | 0.017 |
+| coordinates vs PyTorch | ≤ 0.0048 px — identical for **all** dtypes ||||
+| cuda · text latency | 52.8 ms | 41.4 | 41.3 | **41.2** |
+| vulkan · text latency | 51.5 | **48.9** | 51.7 | 52.4 |
+| cpu · text latency | 1555 | 1734 | 1671 | **1211** |
 
 Choosing:
-- **q4_K** — the default recommendation: same size as q4_0, clearly better
-  accuracy, and by far the fastest CPU config (its Goldmann-style kernels win
-  even though `GGML_LLAMAFILE=ON` makes fp32 unusually strong on CPU; the
-  simpler q4_0 dequant path does not).
-- **q4_0** — marginally fastest on CUDA; simplest encoding.
+- **q4_K** — the default recommendation: same 483 MiB footprint as the
+  simpler Q4_0 encoding (engine-supported via `--dtype q4_0`, not shipped)
+  with clearly better accuracy, and by far the fastest CPU config (its
+  Goldmann-style kernels win even though `GGML_LLAMAFILE=ON` makes fp32
+  unusually strong on CPU).
 - **q8_0** — near-lossless (≤ 0.002) at half the q4 size.
 - **f16** — best Vulkan latency, near-lossless.
 - **f32** — reference for parity debugging.
@@ -252,13 +262,110 @@ text with bbox ROI, cross-image visual support). Results:
   including both q4 dtypes — reproduces PyTorch to ≤ 0.0004 px mean on the
   multimodal and visual examples and 0.29 px mean (worst single keypoint
   2.85 px, identical in fp32) on the bbox example; score diff ≤ 0.031.
-- **All 15 images**: f32/f16/q8_0 agree point-for-point with PyTorch on the
-  9 confidently-localized images (mean ≤ 0.4 px, max ≤ 1.3 px); the q4
-  dtypes stay sub-pixel-to-few-px on most keypoints but can shift the argmax
-  by tens of pixels on **near-flat heatmaps** (multi-object scenes where
-  PyTorch itself scores < 0.1 and the peak is not meaningful). This is the
-  honest boundary of 4-bit: use q4 when scores are trusted, use
-  f16/q8_0/f32 when every argmax must be reproducible.
+- **All 15 images, 86 keypoints** (after the byte-exact image pipeline):
+  heatmap peak *values* match PyTorch to ~1e-5. On the 37 keypoints the
+  official model is confident about (score >= 0.3) **f32/f16 track it at
+  0.003 px mean / 0.01 px max with zero argmax flips**; q8_0 stays at
+  0.14 px mean with one isolated one-cell flip on a near-tie peak; q4_K
+  keeps most keypoints (1.3 px mean, 5 isolated flips — 4-bit noise on
+  near-tie peaks is random, not cumulative). The remaining 49 keypoints
+  score < 0.3 in PyTorch itself — flat heatmaps where the argmax is noise;
+  there f32/f16 now also agree point-for-point on almost all of them
+  (0.55 px mean, 2 isolated flips), while the q4 dtypes shift on
+  noise-floor peaks (their documented boundary). Use q4 when scores are
+  trusted, use f16/q8_0/f32 when every argmax must be reproducible, and
+  use the official multi-object pipeline (below) for the flat scenes.
+
+### Multi-object pipeline alignment (detector ROIs + visual prompts)
+
+The official multi-object flow (`test_real_world/multi_obj_gkd_inference.py`)
+has two stages: an **object detector** produces per-class ROI boxes, then the
+GKD model runs each class's bbox list with its resolved prompts (user prompts,
+else the official per-class predefined schema) and optional 1-shot visual
+support. The detector is the **ultralytics-ggml submodule** (pure C++
+YOLO-World, see the dedicated section below) — the official Python adapters
+(GroundingDINO / LocateAnything) remain available under
+`test_real_world/object_detector_lib/` as reference paths.
+
+The C++ runtime fully covers stage 2 and plugs into stage 1 through the
+detector's exact interface - bbox coordinates:
+
+- `gkd-cli detect --bbox x1 y1 x2 y2 ...` runs ALL ROIs of a class in one
+  call, numerically identical to the official `demo()` for that class
+  (verified by `scripts/parity_multi_object.py`: with identical bbox lists
+  injected at the detector interface, every confident ROI reproduces
+  PyTorch to 0.0002 px / 0.006 score; the only divergent ROI in the test
+  matrix is a synthetic background box whose OFFICIAL scores are all < 0.03
+  - a noise-floor argmax, not a stage-2 deviation).
+- `run_multi_object.py` (repository root) reproduces the official
+  end-to-end script: it runs the official detector code unchanged (or takes
+  `--bboxes-json`), resolves prompts exactly like the official
+  `get_prompt_info`, invokes the engine per class, and merges results into
+  the official per-class structure.
+- Porting the detectors themselves to ggml is out of scope: LocateAnything
+  is a 3B VLM and GroundingDINO needs deformable attention - both far
+  beyond the GKD graph, while the bbox interface loses nothing.
+
+### Pure-C++ multi-object detector (ultralytics-ggml submodule)
+
+Stage 1 of the multi-object pipeline is an **open-vocabulary detector**. It is
+provided by the `ultralytics-ggml` git submodule (pinned to the same ggml
+v0.21.0 / 8599e0ea as this repo), which ships a complete C++/ggml inference
+graph for the YOLO family including YOLO-World. The multi-object pipeline is
+therefore **pure C++ end-to-end**: yolo-cli detects per-class boxes (JSON) and
+the GKDT engine turns them into keypoints - no Python anywhere.
+
+```bash
+git submodule update --init cpp_ggml/third_party/ultralytics-ggml
+# build the detector (once; CUDA flavor shown)
+cmake -S cpp_ggml/third_party/ultralytics-ggml/cpp_ggml -B cpp_ggml/third_party/ultralytics-ggml/cpp_ggml/build-cuda \
+      -DYOLO_GGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp_ggml/third_party/ultralytics-ggml/cpp_ggml/build-cuda -j
+
+# detector weights (yolov8x-worldv2 + the CLIP ViT-B/32 text encoder)
+~/anaconda3/envs/python3.12/bin/python cpp_ggml/third_party/ultralytics-ggml/cpp_ggml/scripts/convert_yolo_to_gguf.py \
+    --model yolov8x-worldv2 --dtype f16 --output cpp_ggml/models/gguf/yolov8x-worldv2-f16.gguf
+~/anaconda3/envs/python3.12/bin/python cpp_ggml/third_party/ultralytics-ggml/cpp_ggml/scripts/convert_clip_to_gguf.py \
+    --model ViT-B/32 --dtype f16 --output cpp_ggml/models/gguf/clip-ViT-B-32-f16.gguf
+
+# end-to-end multi-object GKD, pure C++ detection + C++ keypoint engine
+python3 run_multi_object.py --input test_real_world/ims1/cat_dog.jpg \
+    --obj-type 'cat, dog' --backend cuda --dtype q4_K
+```
+
+The prior GroundingDINO C++-side artifacts (the four converted GGUFs and their
+converter) were removed with this switch. The official Python adapters under
+`test_real_world/object_detector_lib/` remain untouched - they are part of the
+upstream demo and can still serve as a PyTorch reference for parity studies.
+
+**Quality boundary (measured, keep in mind when choosing `--obj-type`):**
+YOLO-World boxes vs the official GroundingDINO boxes on the 86-ROI official
+matrix: recall@IoU0.5 **0.791** (dense scenes suffer: fish school 28/37, pig
+3/7, truck 0/1), matched IoU 0.865, and an end-to-end keypoint displacement of
+**mean 18.5 px / max 206 px** through the SAME engine
+(`scripts/yolo_world_compare.py`, `benchmarks/yolo_world_ablation.json`) -
+the box IS the GKD coordinate system, so detector quality propagates 1:1.
+SAM3 (via the sibling `sam3-ggml` project, whose detection head is a
+standard-attention DETR that needs no new ggml ops) is the candidate for
+official-grade boxes through the same bbox-JSON interface once it exposes a
+batch CLI; its repo has already been aligned to the same ggml v0.21.0.
+
+End-to-end charts of the pure-C++ pipeline (both stages running for real) are
+in `benchmarks/`:
+
+- `cpp_e2e_single.png` — official PyTorch vs C++ ggml engine, all three prompt
+  modes on the official demo image (coordinate delta 0.0001 px);
+- `cpp_e2e_multi.png` — the FULL multi-object pipeline on three official
+  multi-object images: official PyTorch (GroundingDINO + GKDT) vs PURE C++
+  (YOLO-World-ggml + gkd-cli). The two columns differ exactly by the detector:
+  22 matched objects, mean end-to-end keypoint displacement **6.4 px**
+  (max 55.6 px) with the same GKD engine — the quantified cost of the
+  detector switch (`cpp_e2e_multi.json`).
+
+Implementation note: detection boxes can be NEGATIVE at image borders, so the
+CLI's repeatable numeric options (`--bbox`, `--support-kps`) now detect value
+tokens with `strtof` instead of "starts with '-'" — a negative first
+coordinate previously terminated the option and aborted the run.
 
 ## 3. Run inference
 
@@ -310,7 +417,7 @@ python scripts/parity_reference.py diff /tmp/gkd_taps /tmp/gkd_cpp_taps
 
 # full latency + accuracy matrix (15 official images x 3 prompt modes x
 # every discovered backend x dtype config: cpu/cuda/vulkan x
-# f32/f16/q8_0/q4_0/q4_K — configs are auto-discovered from the built
+# f32/f16/q8_0/q4_K — configs are auto-discovered from the built
 # binaries and converted GGUF files, nothing is cherry-picked)
 python scripts/run_all_tests.py --warmup 2 --iters 5
 python scripts/bench_pytorch.py --warmup 3 --iters 10     # PyTorch reference
@@ -325,6 +432,14 @@ python scripts/render_parity.py                           # parity grid image
 python scripts/accuracy_all_images.py                   # every engine config
 # -> benchmarks/accuracy_all_images.json + accuracy_by_image.png
 python scripts/render_parity.py --grid                  # parity_official_examples.png
+
+# multi-object pipeline: GKD-stage parity vs the official demo() with
+# identical bbox lists injected at the detector interface, and the official
+# detector + C++ engine end-to-end script (repository root):
+~/anaconda3/envs/python3.12/bin/python scripts/parity_multi_object.py --backend cuda
+python3 ../run_multi_object.py --input ../test_real_world/ims1/cat_dog.jpg \
+    --obj-type 'cat, dog' --backend cuda --dtype q4_K      # needs detector weights
+python3 ../run_multi_object.py --input img.jpg --bboxes-json dets.json  # no detector needed
 ```
 
 Interpretation notes for the tap diff: `in_ims`, `vis_tokens` and `context`

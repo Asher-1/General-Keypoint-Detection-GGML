@@ -144,25 +144,33 @@ def main():
         print("wrote", p)
 
     # ---------- grouped bars, one panel per mode ----------
+    # Log-scale y axis: the interesting quantity is the RATIO between configs
+    # (50x cpu-vs-gpu spread would hide every GPU bar on a linear axis, while
+    # equal heights on a log axis mean equal ratios). The dashed PyTorch
+    # reference line stays meaningful on a log axis.
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=False)
     for ax, mode in zip(axes, MODES):
         vals = [np.mean(mean[mode].get(c, [np.nan])) for c in configs]
         cols = [BACKEND_COLORS.get(c.rsplit("-", 1)[0], "#999999") for c in configs]
         bars = ax.bar(range(len(configs)), vals, color=cols)
+        ax.set_yscale("log")
+        lo = min(v for v in vals if not np.isnan(v) and v > 0)
+        hi = max(v for v in vals if not np.isnan(v))
+        ax.set_ylim(lo * 0.5, hi * 2.5)
         for x, v in zip(range(len(configs)), vals):
             if np.isnan(v):
                 continue
             label = f"{v / 1000:.2f}s" if v >= 1000 else f"{v:.0f}"
-            ax.text(x, v * 1.02, label, ha="center", fontsize=7)
+            ax.text(x, v * 1.12, label, ha="center", fontsize=7)
         if py_mean and mode in py_mean:
             ax.axhline(py_mean[mode], color=BACKEND_COLORS["pytorch"], ls="--", lw=1.2)
-            ax.text(len(configs) - 0.4, py_mean[mode] * 1.05, "pytorch-cuda",
+            ax.text(len(configs) - 0.4, py_mean[mode] * 1.15, "pytorch-cuda",
                     color=BACKEND_COLORS["pytorch"], fontsize=8, ha="right")
         ax.set_xticks(range(len(configs)))
         ax.set_xticklabels(configs, rotation=30, ha="right", fontsize=8)
-        ax.set_ylabel("latency (ms)")
+        ax.set_ylabel("latency (ms, log scale)")
         ax.set_title(f"{mode} prompts", fontsize=10)
-        ax.grid(axis="y", alpha=0.3)
+        ax.grid(axis="y", which="both", alpha=0.3)
     handles = [plt.Rectangle((0, 0), 1, 1, color=BACKEND_COLORS[b]) for b in BACKEND_ORDER]
     axes[0].legend(handles, BACKEND_ORDER, fontsize=8)
     fig.suptitle("GKDT-L inference latency by config (15 official images)", y=0.995)
@@ -233,6 +241,12 @@ def main():
         cfg_tags = [c for c in configs if c in A.get("configs", {})]
         images = sorted(A.get("pytorch_ref", {}).get("images", {}))
         if cfg_tags and images:
+            # per-image PyTorch self-confidence (max keypoint score): on images
+            # where the OFFICIAL model itself scores < ~0.2 the heatmap is flat
+            # and the argmax location is not meaningful - annotate them.
+            conf = {im: max(A["pytorch_ref"]["images"][im]["scores"])
+                    for im in images}
+            flat = {im for im in images if conf[im] < 0.3}
             mat = np.full((len(cfg_tags), len(images)), np.nan)
             for i, c in enumerate(cfg_tags):
                 for j, im in enumerate(images):
@@ -251,12 +265,19 @@ def main():
                     ax.text(j, i, f"{v:.3f}" if v < 1 else f"{v:.1f}",
                             ha="center", va="center", fontsize=7,
                             color="white" if norm(v) < 0.6 else "#111111")
+            labels = [im + ("\n⚠ flat" if im in flat else "") for im in images]
             ax.set_xticks(range(len(images)))
-            ax.set_xticklabels(images, rotation=35, ha="right", fontsize=8)
+            ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
+            for j, im in enumerate(flat):
+                if im in images:
+                    ax.axvspan(images.index(im) - 0.5, images.index(im) + 0.5,
+                               color="red", alpha=0.06)
             ax.set_yticks(range(len(cfg_tags)))
             ax.set_yticklabels(cfg_tags, fontsize=9)
             ax.set_title("mean keypoint error vs stock PyTorch (px, log scale;\n"
-                         "all 15 official images, text prompts)", fontsize=10)
+                         "all 15 official images, text prompts)\n"
+                         "⚠ = official PyTorch itself scores <0.3 here (flat heatmap, "
+                         "argmax location not meaningful)", fontsize=10)
             fig.colorbar(im2, ax=ax, label="px (log)", shrink=0.8)
             fig.tight_layout()
             p = os.path.join(BENCH, "accuracy_by_image.png")

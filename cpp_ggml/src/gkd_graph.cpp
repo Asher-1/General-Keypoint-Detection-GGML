@@ -768,6 +768,18 @@ bool GkdSession::detect(const RgbImage& image, const float* bboxes, int n_bbox,
 
     // ---------------- 4) prompts (padding per the official PAD_KPS) --------
     const int n_v = extra.has_support ? (int)s_kps_norm[0].size() / 2 : 0;
+    // The official model refuses these two cases (openkd_heatmap_fuse cannot
+    // broadcast N_t != N_v heatmaps and forward() asserts on empty prompts):
+    if (n_t == 0 && n_v == 0) {
+        GKD_LOG_ERROR("no prompts given: need --kps-texts and/or --support-image + --support-kps");
+        return false;
+    }
+    if (n_t > 0 && n_v > 0 && n_t != n_v) {
+        GKD_LOG_ERROR("multimodal prompts require matching counts: %d texts vs %d "
+                      "support keypoints (the official fuse pairs row i with row i)",
+                      n_t, n_v);
+        return false;
+    }
     std::vector<float> vis_proto;
     if (n_v > 0) {
         vis_proto.resize((size_t)n_v * P.D);
@@ -799,11 +811,15 @@ bool GkdSession::detect(const RgbImage& image, const float* bboxes, int n_bbox,
     if (!vis_proto.empty()) dump_tap("vis_proto", {n_v, P.D}, vis_proto.data());
 
     // ---------------- 5) detect graph per query image ----------------
-    if (!build_detect_graph(n_t_pad, n_v_pad)) return false;
     std::vector<float> heat_q((size_t)N * P.heat_w() * P.heat_w());
     std::vector<DetectOutput> results(n_bbox);
     double detect_ms = 0, decode_ms = 0;
     for (int i = 0; i < n_bbox; i++) {
+        // NOTE the graph is REBUILT for every ROI: re-running alloc+compute on
+        // one cached graph produced garbage on CUDA for the second ROI (same
+        // family as the cross-call graph-cache issue; rebuild cost is
+        // negligible next to the GPU compute).
+        if (!build_detect_graph(n_t_pad, n_v_pad)) return false;
         // query features for ROI i: vision batch index = (has_support ? 1 : 0) + i
         const int bidx = (extra.has_support ? 1 : 0) + i;
         std::vector<float> qf_in((size_t)P.feat_w * P.feat_w * P.D);

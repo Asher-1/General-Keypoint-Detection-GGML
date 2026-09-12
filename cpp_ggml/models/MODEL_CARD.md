@@ -39,6 +39,23 @@ wget https://huggingface.co/Asher-1/GKD_GGUF/resolve/main/gkd_fullset-q4_K.gguf 
      -O cpp_ggml/models/gguf/gkd_fullset-q4_K.gguf
 ```
 
+### Test data
+
+The 15 official real-world test images used for the accuracy and latency
+benchmarks live in `test_real_world/ims1/` (included in this repository).
+They are also published as a standalone download for use outside the repo:
+
+- **https://github.com/Asher-1/cloudViewer_downloads/releases/tag/general_keypoint_detection_data**
+
+```bash
+wget https://github.com/Asher-1/cloudViewer_downloads/releases/download/general_keypoint_detection_data/general_keypoint_detection_data.zip
+unzip general_keypoint_detection_data.zip -d test_real_world/ims1_ \
+    && mv test_real_world/ims1_/* test_real_world/ims1/
+```
+
+The archive contains the 15 demo images (2007_007524.jpg, cat_dog.jpg,
+alpaca_150.jpg, ...) plus `facets.bin` from the official demo package.
+
 ## Files — per-model details
 
 | file | dtype | size | download |
@@ -46,7 +63,6 @@ wget https://huggingface.co/Asher-1/GKD_GGUF/resolve/main/gkd_fullset-q4_K.gguf 
 | `gguf/gkd_fullset-f32.gguf` | F32 | 3.39 GiB | [link](https://huggingface.co/Asher-1/GKD_GGUF/resolve/main/gkd_fullset-f32.gguf) |
 | `gguf/gkd_fullset-f16.gguf` | F16 weights | 1.70 GiB | [link](https://huggingface.co/Asher-1/GKD_GGUF/resolve/main/gkd_fullset-f16.gguf) |
 | `gguf/gkd_fullset-q8_0.gguf` | Q8_0 weights | 905 MiB | [link](https://huggingface.co/Asher-1/GKD_GGUF/resolve/main/gkd_fullset-q8_0.gguf) |
-| `gguf/gkd_fullset-q4_0.gguf` | Q4_0 weights | 483 MiB | [link](https://huggingface.co/Asher-1/GKD_GGUF/resolve/main/gkd_fullset-q4_0.gguf) |
 | `gguf/gkd_fullset-q4_K.gguf` | Q4_K weights | 483 MiB | [link](https://huggingface.co/Asher-1/GKD_GGUF/resolve/main/gkd_fullset-q4_K.gguf) |
 
 All five run on all three backends (cpu / cuda / vulkan). Only 2-D weight
@@ -90,20 +106,6 @@ heatmaps (see *Verified accuracy* below).
 - Use when: you want fp32-grade behavior at ~3.7× less disk/memory than
   fp32 — the safe compact choice.
 
-### `gkd_fullset-q4_0.gguf` — simplest 4-bit (483 MiB)
-
-- Q4_0 blocks (32 values, one f16 scale, `d = signed_max/-8`), 4.5 bits per
-  weight. Simple encoding, but a single outlier in a block degrades the
-  other 31 values.
-- Accuracy: score diff ≤ 0.026; on the official demos keypoints match
-  PyTorch to ≤ 0.0004 px mean, but on near-flat heatmaps (scenes where
-  PyTorch itself scores < 0.1) the argmax can shift by tens of pixels.
-- Latency (text): **cuda 40.7 ms (fastest overall, 5.7× vs PyTorch)** ·
-  vulkan 52.5 ms · cpu 1882 ms (slower than fp32 — the simple dequant path
-  loses to tinyBLAS fp32 on x86).
-- Use when: maximum CUDA throughput matters more than last-bit score
-  fidelity.
-
 ### `gkd_fullset-q4_K.gguf` — super-block 4-bit, recommended (483 MiB)
 
 - Q4_K super-blocks (256 values, 8 sub-blocks of 32 with independent 6-bit
@@ -111,7 +113,7 @@ heatmaps (see *Verified accuracy* below).
   same size as Q4_0, materially lower quantization error.
 - Accuracy: score diff ≤ 0.017 (best of the two q4 variants); official demo
   keypoints ≤ 0.0004 px mean / 2.85 px worst (identical to fp32). Same
-  near-flat-heatmap argmax caveat as q4_0, but milder.
+  The near-flat-heatmap argmax caveat is milder than the simpler Q4_0 encoding.
 - Latency (text): cuda 41.2 ms (5.6×) · vulkan 52.4 ms · **cpu 1211 ms —
   the fastest CPU config of the whole matrix** (Goldmann-style Q4_K kernels
   beat even the fp32 tinyBLAS path).
@@ -153,12 +155,12 @@ reference quantizers and were cross-verified against `ggml_quantize_chunk`
 (Q4_0 byte-identical; Q4_K identical modulo the reference's own near-tie
 float ordering).
 
-| | f32 | f16 | q8_0 | q4_0 | q4_K |
-|---|---|---|---|---|---|
-| size (GKDT-L) | 3.39 GiB | 1.70 GiB | 905 MiB | 483 MiB | 483 MiB |
-| bits/value (2-D weights) | 32 | 16 | 8.5 | 4.5 | 4.5 |
-| max score diff vs PyTorch | 0.0011 | 0.0012 | 0.0021 | 0.026 | 0.017 |
-| best backend latency (text) | 51.5 (vulkan) | 41.4 (cuda) | 41.3 (cuda) | **40.7 (cuda)** | 41.2 (cuda) / **1211 ms cpu** |
+| | f32 | f16 | q8_0 | q4_K |
+|---|---|---|---|---|
+| size (GKDT-L) | 3.39 GiB | 1.70 GiB | 905 MiB | 483 MiB |
+| bits/value (2-D weights) | 32 | 16 | 8.5 | 4.5 |
+| max score diff vs PyTorch | 0.0011 | 0.0012 | 0.0021 | 0.017 |
+| best backend latency (text) | 51.5 (vulkan) | 41.4 (cuda) | 41.3 (cuda) | 41.2 (cuda) / **1211 ms cpu** |
 
 ## Conversion (only if not downloading)
 
@@ -166,7 +168,7 @@ The pre-built files above come from exactly this command, so converting
 yourself is only needed for a custom dtype/checkpoint:
 
 ```bash
-python scripts/convert_gkd_to_gguf.py --dtype f32   # also: f16, q8_0, q4_0, q4_K
+python scripts/convert_gkd_to_gguf.py --dtype f32   # also: f16, q8_0, q4_0 (optional), q4_K
 # input: models/pytorch/gkd_fullset.best -> models/gguf/gkd_fullset-<dtype>.gguf
 ```
 
@@ -189,17 +191,14 @@ reference (full detail in `../benchmarks/accuracy.json`):
 | `cpu-f32` | 0.0005 | 0.0009 | 0.0007 |
 | `cpu-f16` | 0.0005 | 0.0009 | 0.0007 |
 | `cpu-q8_0` | 0.0009 | 0.0008 | 0.0011 |
-| `cpu-q4_0` | 0.0098 | 0.0249 | 0.0078 |
 | `cpu-q4_K` | 0.0056 | 0.0140 | 0.0066 |
 | `cuda-f32` | 0.0005 | 0.0011 | 0.0007 |
 | `cuda-f16` | 0.0005 | 0.0006 | 0.0004 |
 | `cuda-q8_0` | 0.0003 | 0.0003 | 0.0013 |
-| `cuda-q4_0` | 0.0098 | 0.0248 | 0.0076 |
 | `cuda-q4_K` | 0.0094 | 0.0172 | 0.0068 |
 | `vulkan-f32` | 0.0010 | 0.0008 | 0.0012 |
 | `vulkan-f16` | 0.0012 | 0.0008 | 0.0011 |
 | `vulkan-q8_0` | 0.0009 | 0.0021 | 0.0003 |
-| `vulkan-q4_0` | 0.0098 | 0.0260 | 0.0069 |
 | `vulkan-q4_K` | 0.0057 | 0.0115 | 0.0037 |
 
 ### All-image sweep + official demo commands
@@ -214,12 +213,31 @@ visual support from alpaca_150.jpg):
   mean (multimodal, visual) and 0.29 px mean / 2.85 px worst keypoint (bbox;
   the same 2.85 px appears in fp32 — it is the 96×96 grid's 2 px cell size on
   a near-tie peak, not a precision artifact); score diff ≤ 0.031.
-- all 15 images: f32/f16/q8_0 match PyTorch point-for-point on the 9
-  confidently-localized images (mean ≤ 0.4 px, max ≤ 1.3 px). The q4 dtypes
-  keep most keypoints but can shift the argmax by tens of pixels on
-  near-flat heatmaps (scenes where PyTorch itself scores < 0.1) — use q4 for
-  confident detection workloads, f16/q8_0 when every argmax must be
-  bit-reproducible.
+- all 15 images, per-keypoint facts (86 keypoints; a keypoint counts as
+  confident when the official PyTorch score for it is >= 0.3 — 37 are
+  confident, 49 are not). Measured with the **byte-exact image pipeline**
+  (libjpeg JPEG decode + Pillow's fixed-point resample, 0 differing bytes
+  vs the official preprocessing on every tested image and ROI):
+  - confident keypoints (37): **f32/f16 mean 0.003 px, max 0.01 px, zero
+    argmax flips** — they track PyTorch point-for-point; q8_0 mean 0.14 px
+    with one isolated one-cell flip on a near-tie peak; q4_K mean 1.3 px
+    with 5 isolated flips (4-bit noise on near-tie peaks is random, not
+    cumulative). Heatmap peak **values** agree with PyTorch to ~1e-5
+    across all 15 images — only near-tie peak *locations* can differ.
+  - non-confident keypoints (49): the official model itself scores < 0.3
+    there (multi-object scenes under text-only prompts) and the heatmap is
+    flat — the argmax location is noise for PyTorch and for us. With the
+    byte-exact pipeline f32/f16 now also agree point-for-point on almost
+    all of them (0.55 px mean, 2 isolated flips); the q4 dtypes shift on
+    noise-floor peaks (their documented boundary).
+  - re-running the sweep reproduces every score bit-exactly.
+
+  In short: there is no systematic precision gap. Where the official model
+  is confident, f32/f16 are point-identical and q4_K tracks it with
+  isolated near-tie flips; where it is not, no implementation can — use the
+  official multi-object pipeline (detector ROIs + visual prompts,
+  reproduced by `../../run_multi_object.py`) for those scenes, exactly as
+  the official demo does.
 - visuals: `accuracy_by_image.png` (config × image error heatmap),
   `parity_official_examples.png` (keypoint overlay grid, PyTorch vs three
   q4_K backends).
@@ -229,10 +247,10 @@ PyTorch on CUDA, RTX 4090) — generated table, see
 `../benchmarks/speedup_table.md` and the matrices
 `../benchmarks/latency_matrix.png` / `../benchmarks/speedup_matrix.png`:
 
-| mode | cpu-f32 | cpu-f16 | cpu-q8_0 | cpu-q4_0 | cpu-q4_K | cuda-f32 | cuda-f16 | cuda-q8_0 | cuda-q4_0 | cuda-q4_K | vulkan-f32 | vulkan-f16 | vulkan-q8_0 | vulkan-q4_0 | vulkan-q4_K | pytorch-cuda (ref) |
-| text | 1555.2 (0.1x) | 1733.6 (0.1x) | 1670.6 (0.1x) | 1882.3 (0.1x) | 1211.2 (0.2x) | 52.8 (4.4x) | 41.4 (5.6x) | 41.3 (5.6x) | 40.7 (5.7x) | 41.2 (5.6x) | 51.5 (4.5x) | 48.9 (4.7x) | 51.7 (4.5x) | 52.5 (4.4x) | 52.4 (4.4x) | 231.5 |
-| visual | 1625.5 (0.1x) | 1781.3 (0.1x) | 1759.3 (0.1x) | 1911.4 (0.1x) | 1342.0 (0.1x) | 49.8 (2.7x) | 42.4 (3.1x) | 40.7 (3.2x) | 41.7 (3.2x) | 40.0 (3.3x) | 47.3 (2.8x) | 44.6 (3.0x) | 50.2 (2.6x) | 50.0 (2.6x) | 47.4 (2.8x) | 131.9 |
-| multimodal | 2102.7 (0.1x) | 2342.4 (0.1x) | 2188.4 (0.1x) | 2441.4 (0.1x) | 1583.5 (0.2x) | 60.4 (5.0x) | 55.1 (5.4x) | 47.0 (6.4x) | 45.5 (6.6x) | 46.0 (6.5x) | 57.1 (5.3x) | 52.3 (5.7x) | 56.7 (5.3x) | 59.7 (5.0x) | 55.5 (5.4x) | 299.8 |
+| mode | cpu-f32 | cpu-f16 | cpu-q8_0 | cpu-q4_K | cuda-f32 | cuda-f16 | cuda-q8_0 | cuda-q4_K | vulkan-f32 | vulkan-f16 | vulkan-q8_0 | vulkan-q4_K | pytorch-cuda (ref) |
+| text | 1555.2 (0.1x) | 1733.6 (0.1x) | 1670.6 (0.1x) | 1211.2 (0.2x) | 52.8 (4.4x) | 41.4 (5.6x) | 41.3 (5.6x) | 41.2 (5.6x) | 51.5 (4.5x) | 48.9 (4.7x) | 51.7 (4.5x) | 52.4 (4.4x) | 231.5 |
+| visual | 1625.5 (0.1x) | 1781.3 (0.1x) | 1759.3 (0.1x) | 1342.0 (0.1x) | 49.8 (2.7x) | 42.4 (3.1x) | 40.7 (3.2x) | 40.0 (3.3x) | 47.3 (2.8x) | 44.6 (3.0x) | 50.2 (2.6x) | 47.4 (2.8x) | 131.9 |
+| multimodal | 2102.7 (0.1x) | 2342.4 (0.1x) | 2188.4 (0.1x) | 1583.5 (0.2x) | 60.4 (5.0x) | 55.1 (5.4x) | 47.0 (6.4x) | 46.0 (6.5x) | 57.1 (5.3x) | 52.3 (5.7x) | 56.7 (5.3x) | 55.5 (5.4x) | 299.8 |
 
 ## License
 

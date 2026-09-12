@@ -56,8 +56,9 @@ static void utf8_append(std::string& s, uint32_t cp) {
 
 // Unicode category approximation used by the CLIP regex
 //   <\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+
-// Covers ASCII exactly; non-ASCII code points are classified with the common
-// letter/digit/space ranges and default to letter (documented approximation).
+// Covers ASCII exactly; well-known non-ASCII letter/digit/punctuation ranges
+// are classified explicitly, and unknown code points default to letter (the
+// overwhelming majority of unlisted scripts are letters).
 enum class Cat { Space, Letter, Digit, Other };
 
 static Cat category(uint32_t cp) {
@@ -71,10 +72,34 @@ static Cat category(uint32_t cp) {
     if (cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
         cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000)
         return Cat::Space;
-    // digits (Nd)
+    // combining marks: ftfy runs NFC before the regex, so marks attach to the
+    // preceding letter; approximating that by folding marks into Letter.
+    if ((cp >= 0x300 && cp <= 0x36F) || (cp >= 0x483 && cp <= 0x489) ||
+        (cp >= 0x591 && cp <= 0x5C7) || (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+        (cp >= 0x1DC0 && cp <= 0x1DFF))
+        return Cat::Letter;
+    // digits / numbers (Nd and the common No ranges)
     if ((cp >= 0x0660 && cp <= 0x0669) || (cp >= 0x06F0 && cp <= 0x06F9) ||
-        (cp >= 0x0966 && cp <= 0x096F) || (cp >= 0xFF10 && cp <= 0xFF19))
+        (cp >= 0x0966 && cp <= 0x096F) || (cp >= 0xFF10 && cp <= 0xFF19) ||
+        cp == 0xB2 || cp == 0xB3 || cp == 0xB9 || (cp >= 0xBC && cp <= 0xBE) ||
+        (cp >= 0x2070 && cp <= 0x2079) || (cp >= 0x2080 && cp <= 0x2089) ||
+        (cp >= 0x2150 && cp <= 0x218F) || (cp >= 0x2460 && cp <= 0x2473) ||
+        cp == 0x3007)
         return Cat::Digit;
+    // punctuation / symbols / format characters -> [^\s\p{L}\p{N}]+
+    if ((cp >= 0xA1 && cp <= 0xBF && cp != 0xAA && cp != 0xB5 && cp != 0xBA) ||
+        cp == 0xAD || cp == 0xD7 || cp == 0xF7 ||
+        (cp >= 0x2000 && cp <= 0x206F) ||   // general punctuation (spaces handled above)
+        (cp >= 0x207A && cp <= 0x207E) || (cp >= 0x208A && cp <= 0x208E) ||
+        (cp >= 0x20A0 && cp <= 0x20CF) ||   // currency
+        (cp >= 0x2190 && cp <= 0x2BFF) ||   // arrows, math operators, misc symbols, dingbats
+        (cp >= 0x2E00 && cp <= 0x2E7F) ||   // supplemental punctuation
+        (cp >= 0x3001 && cp <= 0x303F) ||   // CJK punctuation (3000 is space)
+        (cp >= 0xFE10 && cp <= 0xFE19) || (cp >= 0xFE30 && cp <= 0xFE52) ||
+        (cp >= 0xFE54 && cp <= 0xFE66) || (cp >= 0xFE68 && cp <= 0xFE6B) ||
+        (cp >= 0xFF01 && cp <= 0xFF20) || (cp >= 0xFF3B && cp <= 0xFF40) ||
+        (cp >= 0xFF5B && cp <= 0xFF65) || (cp >= 0xFFE0 && cp <= 0xFFEF))
+        return Cat::Other;
     // letters: latin-1 supplement/extended, greek, cyrillic, hebrew, arabic,
     // devanagari, CJK, kana, hangul and general fallback
     if ((cp >= 0xC0 && cp <= 0x24F && cp != 0xD7 && cp != 0xF7) ||
@@ -85,9 +110,215 @@ static Cat category(uint32_t cp) {
         (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x4E00 && cp <= 0x9FFF) ||
         (cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0xF900 && cp <= 0xFAFF) ||
         (cp >= 0xFF21 && cp <= 0xFF3A) || (cp >= 0xFF41 && cp <= 0xFF5A) ||
-        (cp >= 0xFF66 && cp <= 0xFF9D))
+        (cp >= 0xFF66 && cp <= 0xFF9D) ||
+        (cp >= 0x24B6 && cp <= 0x24E9))      // circled letters
         return Cat::Letter;
     return Cat::Letter;  // default: treat unknown as letter
+}
+
+// ---------------------------------------------------------------------------
+// ftfy subset (the official tokenizer applies ftfy.fix_text before the regex).
+// Implemented pieces, in the official fixer's order:
+//   fix_encoding          latin-1 / sloppy-cp1252 mojibake repair (one layer,
+//                         matching ftfy's default behaviour on our probes)
+//   fix_latin_ligatures, fix_character_width, uncurl_quotes
+//   fix_c1_controls       remaining C1 controls -> their cp1252 character
+//   remove_control_chars  strip Cc except \t \n \r
+// Not implemented: fix_encoding's exotic source encodings (1251/1250/macroman),
+// replace_lossy_sequences detail, NFC normalization (approximated by folding
+// combining marks into the preceding word in category()).
+// ---------------------------------------------------------------------------
+
+// reverse map for the sloppy bytes 0x80-0x9F (cp1252 interpretations)
+static bool cp1252_reverse(uint32_t cp, unsigned char& byte) {
+    static const struct { uint32_t cp; unsigned char b; } tbl[] = {
+        {0x20AC, 0x80}, {0x201A, 0x82}, {0x0192, 0x83}, {0x201E, 0x84},
+        {0x2026, 0x85}, {0x2020, 0x86}, {0x2021, 0x87}, {0x02C6, 0x88},
+        {0x2030, 0x89}, {0x0160, 0x8A}, {0x2039, 0x8B}, {0x0152, 0x8C},
+        {0x017D, 0x8E}, {0x2018, 0x91}, {0x2019, 0x92}, {0x201C, 0x93},
+        {0x201D, 0x94}, {0x2022, 0x95}, {0x2013, 0x96}, {0x2014, 0x97},
+        {0x02DC, 0x98}, {0x2122, 0x99}, {0x0161, 0x9A}, {0x203A, 0x9B},
+        {0x0153, 0x9C}, {0x017E, 0x9E}, {0x0178, 0x9F}};
+    for (const auto& e : tbl)
+        if (e.cp == cp) { byte = e.b; return true; }
+    return false;
+}
+
+// strict UTF-8 validation: rejects overlongs, surrogates and > U+10FFFF
+static bool utf8_valid(const std::string& b) {
+    size_t i = 0, n = b.size();
+    while (i < n) {
+        unsigned char c = (unsigned char)b[i];
+        uint32_t cp;
+        size_t len;
+        if (c < 0x80) { i++; continue; }
+        if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+        else return false;
+        if (i + len > n) return false;
+        for (size_t k = 1; k < len; k++) {
+            unsigned char cc = (unsigned char)b[i + k];
+            if ((cc & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) ||
+            (len == 4 && cp < 0x10000)) return false;      // overlong
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false;    // surrogate
+        if (cp > 0x10FFFF) return false;
+        i += len;
+    }
+    return true;
+}
+
+// One layer of mojibake repair: every maximal run of latin-1/sloppy-cp1252
+// encodable characters (all with cp >= 0x80) is re-encoded to bytes; when
+// those bytes form valid UTF-8 that strictly reduces the number of
+// latin-1-range code points, the run is replaced (the monotonic rule ftfy
+// enforces through its badness scoring).
+static void fix_encoding(std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    std::vector<uint32_t> run;      // codepoints of the current run
+    std::string run_bytes;          // original utf-8 bytes of the run
+    auto flush_run = [&]() {
+        if (run.empty()) return;
+        bool ok = true;
+        std::string bytes;
+        for (uint32_t cp : run) {
+            if (cp <= 0xFF) { bytes += (char)(unsigned char)cp; continue; }
+            unsigned char b;
+            if (!cp1252_reverse(cp, b)) { ok = false; break; }
+            bytes += (char)b;
+        }
+        bool applied = false;
+        if (ok && utf8_valid(bytes)) {
+            size_t j = 0, ncp = 0;
+            while (j < bytes.size()) { utf8_next(bytes, j); ncp++; }
+            if (ncp < run.size()) {           // strictly less mojibake-looking
+                out += bytes;
+                applied = true;
+            }
+        }
+        if (!applied) out += run_bytes;
+        run.clear();
+        run_bytes.clear();
+    };
+    while (i < s.size()) {
+        size_t start = i;
+        uint32_t cp = utf8_next(s, i);
+        unsigned char sink;
+        bool in_run = cp >= 0x80 && (cp <= 0xFF || cp1252_reverse(cp, sink));
+        if (in_run) {
+            run.push_back(cp);
+            run_bytes.append(s, start, i - start);
+        } else {
+            flush_run();
+            out.append(s, start, i - start);
+        }
+    }
+    flush_run();
+    s = std::move(out);
+}
+
+static void fix_c1_controls(std::string& s) {
+    // remaining C1 *characters* (U+0080..U+009F) -> their cp1252 character.
+    // Operates on code points: bytes 0x80-0x9F inside multi-byte sequences
+    // are continuation bytes, not C1 controls.
+    static const struct { unsigned char b; uint32_t cp; } fwd[] = {
+        {0x80, 0x20AC}, {0x82, 0x201A}, {0x83, 0x0192}, {0x84, 0x201E},
+        {0x85, 0x2026}, {0x86, 0x2020}, {0x87, 0x2021}, {0x88, 0x02C6},
+        {0x89, 0x2030}, {0x8A, 0x0160}, {0x8B, 0x2039}, {0x8C, 0x0152},
+        {0x8E, 0x017D}, {0x91, 0x2018}, {0x92, 0x2019}, {0x93, 0x201C},
+        {0x94, 0x201D}, {0x95, 0x2022}, {0x96, 0x2013}, {0x97, 0x2014},
+        {0x98, 0x02DC}, {0x99, 0x2122}, {0x9A, 0x0161}, {0x9B, 0x203A},
+        {0x9C, 0x0153}, {0x9E, 0x017E}, {0x9F, 0x0178}};
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t start = i;
+        uint32_t cp = utf8_next(s, i);
+        if (cp >= 0x80 && cp <= 0x9F) {
+            uint32_t rep = 0;
+            for (const auto& e : fwd)
+                if (e.b == (unsigned char)cp) { rep = e.cp; break; }
+            if (rep) {
+                if (rep < 0x80) out += (char)rep;
+                else if (rep < 0x800) {
+                    out += (char)(0xC0 | (rep >> 6));
+                    out += (char)(0x80 | (rep & 0x3F));
+                } else {
+                    out += (char)(0xE0 | (rep >> 12));
+                    out += (char)(0x80 | ((rep >> 6) & 0x3F));
+                    out += (char)(0x80 | (rep & 0x3F));
+                }
+                continue;
+            }
+        }
+        out.append(s, start, i - start);
+    }
+    s = std::move(out);
+}
+
+static void remove_control_chars(std::string& s) {
+    // strip Cc code points except \t \n \r (code-point level, like ftfy)
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t start = i;
+        uint32_t cp = utf8_next(s, i);
+        bool is_cc = (cp < 0x20 && cp != '\t' && cp != '\n' && cp != '\r') || cp == 0x7F;
+        if (!is_cc) out.append(s, start, i - start);
+    }
+    s = std::move(out);
+}
+
+static void ftfy_subset(std::string& s) {
+    fix_encoding(s);
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        uint32_t cp = utf8_next(s, i);
+        switch (cp) {
+        case 0x2018: case 0x2019: case 0x201A: case 0x201B:
+            out += '\''; break;
+        case 0x201C: case 0x201D: case 0x201E: case 0x201F:
+            out += '"'; break;
+        case 0xFB00: out += "ff"; break;
+        case 0xFB01: out += "fi"; break;
+        case 0xFB02: out += "fl"; break;
+        case 0xFB03: out += "ffi"; break;
+        case 0xFB04: out += "ffl"; break;
+        default:
+            if (cp >= 0xFF01 && cp <= 0xFF5E) {
+                out += (char)(cp - 0xFF01 + 0x21);   // fullwidth -> ASCII
+            } else {
+                // re-encode cp (shortest utf-8 form; matches the input bytes
+                // for all valid utf-8 that utf8_next accepts)
+                if (cp < 0x80) out += (char)cp;
+                else if (cp < 0x800) {
+                    out += (char)(0xC0 | (cp >> 6));
+                    out += (char)(0x80 | (cp & 0x3F));
+                } else if (cp < 0x10000) {
+                    out += (char)(0xE0 | (cp >> 12));
+                    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                    out += (char)(0x80 | (cp & 0x3F));
+                } else {
+                    out += (char)(0xF0 | (cp >> 18));
+                    out += (char)(0x80 | ((cp >> 12) & 0x3F));
+                    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                    out += (char)(0x80 | (cp & 0x3F));
+                }
+            }
+        }
+    }
+    fix_c1_controls(out);
+    remove_control_chars(out);
+    s = std::move(out);
 }
 
 // minimal html.unescape for the entities that matter in practice
@@ -227,8 +458,9 @@ std::vector<std::string> SimpleTokenizer::bpe(const std::string& token) const {
 }
 
 std::vector<int32_t> SimpleTokenizer::encode(const std::string& text_raw) const {
-    // text = whitespace_clean(basic_clean(text)).lower()
+    // text = whitespace_clean(basic_clean(ftfy.fix_text(text))).lower()
     std::string text = text_raw;
+    ftfy_subset(text);
     html_unescape(text);
     // strip + collapse whitespace
     std::string collapsed;
